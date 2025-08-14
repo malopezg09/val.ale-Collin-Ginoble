@@ -1,4 +1,4 @@
-Vehicle's photos
+Fotos del vehículo
 ====
 
-This directory must contain 6 photos of the vehicle (from every side, from top and bottom)
+Este directorio contiene 6 fotos del vehículo (Fotos claras, enfocadas y muestran aspectos de la gestión de movilidad, energía y sensores, y gestión de ibstáculos).
