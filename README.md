@@ -14,13 +14,5 @@ Este repositorio contiene los materiales de ingenieria de un vehículo autónomo
 * `other` is for other files which can be used to understand how to prepare the vehicle for the competition. It may include documentation how to connect to a SBC/SBM and upload files there, datasets, hardware specifications, communication protocols descriptions etc. If there is nothing to add to this location, the directory can be removed.
 
 ## Introduction
+Este proyecto consiste en el desarrollo de un vehículo autónomo basado en Arduino, diseñado para desplazarse de manera independiente; detecta y evita obstáculos en su entorno. El sistema utiliza sensores ultrasónicos para escanear el área frontal y lateral, junto con un servo motor que ayuda a maniobrar la dirección y motores controlados electrónicamnete para la velocidad para maniobrar.
 
-_This part must be filled by participants with the technical clarifications about the code: which modules the code consists of, how they are related to the electromechanical components of the vehicle, and what is the process to build/compile/upload the code to the vehicle’s controllers._
-
-## How to prepare the repo based on the template
-
-_Remove this section before the first commit to the repository_
-
-1. Clone this repo by using the `git clone` functionality.
-2. Remove `.git` directory
-3. [Initialize a new public repository on GitHub](https://github.com/new) by following instructions from "create a new repository on the command line" section (appeared after pressing "Create repository" button).
