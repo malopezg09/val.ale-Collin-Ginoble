@@ -1,0 +1,426 @@
+#include <Servo.h>
+
+// =================================================
+// ====== CONFIGURACIÓN DE PINES Y VARIABLES ======
+// =================================================
+
+// ====== Pines Motores (Controlador L298N o similar con PWM) ======
+const int PWMA = 5;       // Velocidad del motor (PWM)
+const int AIN1 = 7;       // Dirección del motor
+const int STBY = 3;       // Standby para el controlador de motor
+
+// ====== Servo de Dirección ======
+Servo servoDireccion;
+const int PIN_SERVO_DIR = 10;
+
+// ====== Sensores Ultrasónicos ======
+const int trigPinFront = 28; 
+const int echoPinFront = 29;
+const int trigPinRight = 13;
+const int echoPinRight = 12;
+const int trigPinLeft = 42;
+const int echoPinLeft = 43;
+
+// ====== Sensor de color ======
+const int S0 = 22, S1 = 23, S2 = 24, S3 = 25;
+const int sensorOut = 26;
+int redFrequency, greenFrequency, blueFrequency;
+
+// ====== Botón de Modo ======
+const int modeButton = 2;
+int mode = 0; // 0 = detenido, 1 = autónomo, 2 = detenido, 3 = color + autónomo
+
+// ====== Variables de tiempo para control no bloqueante ======
+unsigned long lastColorCheck = 0;
+unsigned long lastUltraCheck = 0;
+const unsigned long colorInterval = 100; // ms
+const unsigned long ultraInterval = 150; // ms
+
+// ====== Variables para Acciones por Color ======
+String accionColor = "NINGUNA"; // "PAUSA", "DERECHA", "IZQUIERDA", "NINGUNA"
+unsigned long tiempoInicioAccion = 0;
+const unsigned long duracionPausa = 600;  // ms
+const unsigned long duracionGiro = 3000;  // ms
+String colorActual = "NINGUNO";
+
+// ====== Calibración del Servo y Distancias ======
+const int centroDireccion = 86;
+const int derecha = 56;
+const int izquierda = 116;
+// NUEVO: Ángulos para correcciones suaves de dirección
+const int GENTLE_RIGHT = 70; // Un poco a la derecha
+const int GENTLE_LEFT = 100; // Un poco a la izquierda
+// NUEVO: Distancia mínima para los lados en cm
+const int SIDE_DISTANCE_THRESHOLD = 15;
+// NUEVO: Distancia mínima para el frente en cm
+const int FRONT_DISTANCE_THRESHOLD = 30; 
+
+// ===================================
+// ====== NUEVA LÓGICA DE ESTADOS ======
+// ===================================
+
+// Estados posibles del carro para una navegación más fluida
+enum CarState {
+  STATE_IDLE,
+  STATE_FORWARD,
+  STATE_EVADE_STOP_1,      // NUEVO: Estado para la primera parada (100ms)
+  STATE_EVADE_BACKWARD,
+  STATE_EVADE_ANALYZE,
+  STATE_EVADE_TURN_LEFT,
+  STATE_EVADE_TURN_RIGHT
+};
+
+CarState currentState = STATE_IDLE;
+unsigned long stateStartTime = 0;
+
+// ===================================
+// ====== FUNCIONES DE MOVIMIENTO ======
+// ===================================
+
+void motorStop() {
+    analogWrite(PWMA, 0);
+    digitalWrite(AIN1, LOW);
+}
+
+void motorForward(int speed = 120) {
+    digitalWrite(AIN1, LOW);
+    analogWrite(PWMA, speed);
+}
+
+void motorBackward(int speed = 120) {
+    digitalWrite(AIN1, HIGH);
+    analogWrite(PWMA, speed);
+}
+
+void motorLeft() {
+    servoDireccion.write(izquierda);
+    motorForward();
+}
+
+void motorRight() {
+    servoDireccion.write(derecha);
+    motorForward();
+}
+
+void motorStraight() {
+    servoDireccion.write(centroDireccion);
+    motorForward();
+}
+
+// ==========================================
+// ====== FUNCIONES DE LECTURA DE SENSORES ======
+// ==========================================
+
+// --- Sensor de Color ---
+void readColorRaw() {
+    digitalWrite(S2, LOW); digitalWrite(S3, LOW);
+    redFrequency = pulseIn(sensorOut, LOW);
+    digitalWrite(S2, HIGH); digitalWrite(S3, HIGH);
+    greenFrequency = pulseIn(sensorOut, LOW);
+    digitalWrite(S2, LOW); digitalWrite(S3, HIGH);
+    blueFrequency = pulseIn(sensorOut, LOW);
+}
+
+String detectColorDominante() {
+    int rSum = 0, gSum = 0, bSum = 0;
+    for (int i = 0; i < 3; i++) {
+        readColorRaw();
+        rSum += redFrequency;
+        gSum += greenFrequency;
+        bSum += blueFrequency;
+        delay(10);
+    }
+    int rAvg = rSum / 3;
+    int gAvg = gSum / 3;
+    int bAvg = bSum / 3;
+
+    if (rAvg < gAvg && rAvg < bAvg) return "ROJO";
+    if (gAvg < rAvg && gAvg < bAvg) return "VERDE";
+    return "NINGUNO";
+}
+
+// --- Sensores Ultrasónicos ---
+long readDistance(int trigPin, int echoPin) {
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+    long duration = pulseIn(echoPin, HIGH, 30000);
+    long dist = duration * 0.034 / 2;
+
+    if (dist < 5 || dist > 300) return -1;
+    return dist;
+}
+
+// ===================================
+// ====      SETUP Y LOOP        ====
+// ===================================
+
+void setup() {
+    Serial.begin(115200);
+
+    pinMode(PWMA, OUTPUT); pinMode(AIN1, OUTPUT); pinMode(STBY, OUTPUT);
+    digitalWrite(STBY, HIGH);
+
+    servoDireccion.attach(PIN_SERVO_DIR);
+
+    pinMode(trigPinFront, OUTPUT); pinMode(echoPinFront, INPUT);
+    pinMode(trigPinRight, OUTPUT); pinMode(echoPinRight, INPUT);
+    pinMode(trigPinLeft, OUTPUT); pinMode(echoPinLeft, INPUT);
+
+    pinMode(S0, OUTPUT); pinMode(S1, OUTPUT);
+    pinMode(S2, OUTPUT); pinMode(S3, OUTPUT);
+    pinMode(sensorOut, INPUT);
+    digitalWrite(S0, HIGH); digitalWrite(S1, HIGH);
+
+    pinMode(modeButton, INPUT_PULLUP);
+
+    servoDireccion.write(centroDireccion);
+    motorStop();
+    Serial.println("Sistema inicializado. Modo: DETENIDO");
+}
+
+void loop() {
+    // Lógica para cambiar de modo con el botón
+    if (digitalRead(modeButton) == LOW) {
+        delay(300);
+        mode++;
+        if (mode > 3)  mode = 0;
+        servoDireccion.write(centroDireccion);
+        accionColor = "NINGUNA";
+        Serial.print("Modo cambiado a: ");
+        if(mode == 0) Serial.println("DETENIDO");
+        if(mode == 1) Serial.println("AUTONOMO");
+        if(mode == 2) Serial.println("DETENIDO");
+        if(mode == 3) Serial.println("COLOR + AUTONOMO");
+        // Resetea el estado del carro al cambiar de modo
+        currentState = STATE_IDLE;
+    }
+
+    switch (mode) {
+        case 0: // DETENIDO
+            motorStop();
+            break;
+
+        case 1: // MODO AUTÓNOMO - La nueva lógica no bloqueante está aquí
+            // Aquí está la lógica que reemplaza a la función evadeObstacle()
+            switch(currentState) {
+                case STATE_IDLE:
+                case STATE_FORWARD:
+                    // Lógica principal de avance y detección
+                    if (millis() - lastUltraCheck >= ultraInterval) {
+                        lastUltraCheck = millis();
+                        long dF = readDistance(trigPinFront, echoPinFront);
+                        long dR = readDistance(trigPinRight, echoPinRight);
+                        long dL = readDistance(trigPinLeft, echoPinLeft);
+                        
+                        Serial.print("Frente: "); Serial.print(dF);
+                        Serial.print(" | Izquierda: "); Serial.print(dL);
+                        Serial.print(" | Derecha: "); Serial.println(dR);
+
+                        if (dF != -1 && dF < FRONT_DISTANCE_THRESHOLD) {
+                            Serial.println("¡Obstáculo FRONTAL detectado! Iniciando evasión...");
+                            currentState = STATE_EVADE_STOP_1; // Transición al nuevo estado de parada
+                            stateStartTime = millis();
+                        } 
+                        else if (dL != -1 && dL < SIDE_DISTANCE_THRESHOLD) {
+                            Serial.println("¡Pared IZQUIERDA muy cerca! Corrigiendo...");
+                            servoDireccion.write(GENTLE_RIGHT);
+                            motorForward();
+                        }
+                        else if (dR != -1 && dR < SIDE_DISTANCE_THRESHOLD) {
+                            Serial.println("¡Pared DERECHA muy cerca! Corrigiendo...");
+                            servoDireccion.write(GENTLE_LEFT);
+                            motorForward();
+                        }
+                        else {
+                            motorStraight();
+                            currentState = STATE_FORWARD;
+                        }
+                    }
+                    break;
+                
+                case STATE_EVADE_STOP_1:
+                    // Se detiene por 100ms, como en tu lógica original
+                    motorStop();
+                    if (millis() - stateStartTime >= 100) {
+                        Serial.println("Parada inicial completada. Retrocediendo...");
+                        currentState = STATE_EVADE_BACKWARD;
+                        stateStartTime = millis();
+                    }
+                    break;
+
+                case STATE_EVADE_BACKWARD:
+                    // Retrocede por 1000ms
+                    motorBackward();
+                    if (millis() - stateStartTime >= 1500) {
+                        Serial.println("Fin del retroceso. Pausando para analizar...");
+                        currentState = STATE_EVADE_ANALYZE;
+                        stateStartTime = millis();
+                    }
+                    break;
+
+                case STATE_EVADE_ANALYZE:
+                    // Pausa de 200ms para analizar
+                    motorStop();
+                    if (millis() - stateStartTime >= 200) {
+                        long distLeft = readDistance(trigPinLeft, echoPinLeft);
+                        long distRight = readDistance(trigPinRight, echoPinRight);
+                        
+                        if (distLeft > distRight) {
+                            Serial.println("Girando a la IZQUIERDA...");
+                            currentState = STATE_EVADE_TURN_LEFT;
+                        } else {
+                            Serial.println("Girando a la DERECHA...");
+                            currentState = STATE_EVADE_TURN_RIGHT;
+                        }
+                        stateStartTime = millis();
+                    }
+                    break;
+
+                case STATE_EVADE_TURN_LEFT:
+                    // Gira a la izquierda
+                    motorLeft();
+                    if (millis() - stateStartTime >= 1000) {
+                        Serial.println("Fin del giro. Volviendo a avanzar.");
+                        currentState = STATE_FORWARD;
+                    }
+                    break;
+
+                case STATE_EVADE_TURN_RIGHT:
+                    // Gira a la derecha
+                    motorRight();
+                    if (millis() - stateStartTime >= 1000) {
+                        Serial.println("Fin del giro. Volviendo a avanzar.");
+                        currentState = STATE_FORWARD;
+                    }
+                    break;
+            }
+            break;
+
+        case 2: // DETENIDO
+            motorStop();
+            break;
+
+        case 3: // MODO COLOR + AUTÓNOMO
+            // La evasión de obstáculos (frontal y lateral) tiene prioridad
+            // La lógica es similar al caso 1, pero con una capa de detección de color
+            
+            if (accionColor == "NINGUNA") {
+                // Lógica de evasión
+                switch(currentState) {
+                    case STATE_IDLE:
+                    case STATE_FORWARD:
+                        if (millis() - lastUltraCheck >= ultraInterval) {
+                            lastUltraCheck = millis();
+                            long dF = readDistance(trigPinFront, echoPinFront);
+                            long dR = readDistance(trigPinRight, echoPinRight);
+                            long dL = readDistance(trigPinLeft, echoPinLeft);
+                            
+                            if (dF != -1 && dF < FRONT_DISTANCE_THRESHOLD) {
+                                Serial.println("¡Obstáculo FRONTAL detectado! (Modo Color)");
+                                currentState = STATE_EVADE_STOP_1;
+                                stateStartTime = millis();
+                            } 
+                            else if (dL != -1 && dL < SIDE_DISTANCE_THRESHOLD) {
+                                servoDireccion.write(GENTLE_RIGHT);
+                                motorForward();
+                            }
+                            else if (dR != -1 && dR < SIDE_DISTANCE_THRESHOLD) {
+                                servoDireccion.write(GENTLE_LEFT);
+                                motorForward();
+                            }
+                            else {
+                                motorStraight();
+                                currentState = STATE_FORWARD;
+                            }
+                        }
+                        break;
+                    
+                    case STATE_EVADE_STOP_1:
+                        motorStop();
+                        if (millis() - stateStartTime >= 100) {
+                            currentState = STATE_EVADE_BACKWARD;
+                            stateStartTime = millis();
+                        }
+                        break;
+
+                    case STATE_EVADE_BACKWARD:
+                        motorBackward();
+                        if (millis() - stateStartTime >= 1000) {
+                            currentState = STATE_EVADE_ANALYZE;
+                            stateStartTime = millis();
+                        }
+                        break;
+
+                    case STATE_EVADE_ANALYZE:
+                        motorStop();
+                        if (millis() - stateStartTime >= 200) {
+                            long distLeft = readDistance(trigPinLeft, echoPinLeft);
+                            long distRight = readDistance(trigPinRight, echoPinRight);
+                            if (distLeft > distRight) {
+                                currentState = STATE_EVADE_TURN_LEFT;
+                            } else {
+                                currentState = STATE_EVADE_TURN_RIGHT;
+                            }
+                            stateStartTime = millis();
+                        }
+                        break;
+
+                    case STATE_EVADE_TURN_LEFT:
+                        motorLeft();
+                        if (millis() - stateStartTime >= 1000) {
+                            currentState = STATE_FORWARD;
+                        }
+                        break;
+
+                    case STATE_EVADE_TURN_RIGHT:
+                        motorRight();
+                        if (millis() - stateStartTime >= 1000) {
+                            currentState = STATE_FORWARD;
+                        }
+                        break;
+                }
+            }
+            
+            // Lógica de color (solo se activa si no se está evadiendo)
+            if (currentState == STATE_FORWARD && accionColor == "NINGUNA" && millis() - lastColorCheck >= colorInterval) {
+                lastColorCheck = millis();
+                String c = detectColorDominante();
+                long distFrontColor = readDistance(trigPinFront, echoPinFront);
+                if (c == "ROJO" && distFrontColor != -1 && distFrontColor <= 20) {
+                    accionColor = "PAUSA";
+                    tiempoInicioAccion = millis();
+                    colorActual = "ROJO";
+                    Serial.println("COLOR ROJO DETECTADO - INICIANDO ACCION");
+                } else if (c == "VERDE" && distFrontColor != -1 && distFrontColor <= 20) {
+                    accionColor = "PAUSA";
+                    tiempoInicioAccion = millis();
+                    colorActual = "VERDE";
+                    Serial.println("COLOR VERDE DETECTADO - INICIANDO ACCION");
+                }
+            }
+            // Máquina de estados para la acción de color (se mantiene igual, no es bloqueante)
+            if (accionColor == "PAUSA") {
+                motorStop();
+                if (millis() - tiempoInicioAccion >= duracionPausa) {
+                    accionColor = (colorActual == "ROJO") ? "DERECHA" : "IZQUIERDA";
+                    tiempoInicioAccion = millis();
+                }
+            } else if (accionColor == "DERECHA") {
+                motorRight();
+                if (millis() - tiempoInicioAccion >= duracionGiro) {
+                    accionColor = "NINGUNA";
+                    Serial.println("FIN ACCION COLOR");
+                }
+            } else if (accionColor == "IZQUIERDA") {
+                motorLeft();
+                if (millis() - tiempoInicioAccion >= duracionGiro) {
+                    accionColor = "NINGUNA";
+                    Serial.println("FIN ACCION COLOR");
+                }
+            }
+            break;
+    }
+}
