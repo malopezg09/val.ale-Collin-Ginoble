@@ -1,0 +1,283 @@
+#include "esp_camera.h"
+#include <Arduino.h>
+#include <WiFi.h>
+#include <math.h>
+
+// ------------------ Pines AI-Thinker ------------------
+#define PWDN_GPIO_NUM   32
+#define RESET_GPIO_NUM  -1
+#define XCLK_GPIO_NUM    0
+#define SIOD_GPIO_NUM   26
+#define SIOC_GPIO_NUM   27
+#define Y9_GPIO_NUM     35
+#define Y8_GPIO_NUM     34
+#define Y7_GPIO_NUM     39
+#define Y6_GPIO_NUM     36
+#define Y5_GPIO_NUM     21
+#define Y4_GPIO_NUM     19
+#define Y3_GPIO_NUM     18
+#define Y2_GPIO_NUM      5
+#define VSYNC_GPIO_NUM  25
+#define HREF_GPIO_NUM   23
+#define PCLK_GPIO_NUM   22
+#define LED_FLASH_PIN    4   // LED blanco onboard
+
+// ------------------ Modo y parámetros ------------------
+// 0=apagado, 1=pulso por frame, 2=continuo PWM
+#define FLASH_MODE          2
+#define FLASH_PWM_CHANNEL   2
+#define FLASH_PWM_FREQ      5000
+#define FLASH_PWM_BITS      8
+#define FLASH_LEVEL         160
+#define FLASH_PULSE_MS      12
+
+// Calibración / salida
+#define CALIBRATION_MODE    1   // 1=imprime HSV/RGB; 0=solo detección
+#define SEND_CHAR           0   // 1=envía 'R','V','M' por Serial (desactivado 0)
+
+// ------------------ ROI y muestreo ------------------
+#define ROI_PERCENT         30
+#define ROI_CX_PERCENT      50
+#define ROI_CY_PERCENT      50
+#define SAMPLE_STEP         3
+
+#define MIN_RATIO           0.15f
+#define USE_EMA             1
+#define EMA_ALPHA           0.40f
+#define PRINT_EVERY_MS      120
+
+// ------------------ Estado ------------------
+static unsigned long lastPrintMs = 0;
+static float h_ema=0, s_ema=0, v_ema=0;
+static float r_ema=0, g_ema=0, b_ema=0;
+static bool ema_init = false;
+
+// ------------------ Utilidades ------------------
+static inline void rgb2hsv(uint8_t r, uint8_t g, uint8_t b, float &h, float &s, float &v) {
+  float rf=r/255.0f, gf=g/255.0f, bf=b/255.0f;
+  float cmax = max(rf, max(gf, bf));
+  float cmin = min(rf, min(gf, bf));
+  float delta = cmax - cmin;
+
+  if (delta == 0)      h = 0.0f;
+  else if (cmax == rf) h = fmodf(((gf - bf) / delta), 6.0f) * 60.0f;
+  else if (cmax == gf) h = (((bf - rf) / delta) + 2.0f) * 60.0f;
+  else                 h = (((rf - gf) / delta) + 4.0f) * 60.0f;
+  if (h < 0) h += 360.0f;
+
+  s = (cmax == 0) ? 0.0f : (delta / cmax);
+  v = cmax;
+}
+
+// ------------------ Clasificador RGB ------------------
+#define L_MIN        40
+#define CHROMA_MIN   18
+#define DOM_T        0.45f
+#define MARGIN       0.08f
+
+const char* classifyColorRGB(int r, int g, int b) {
+  int L = max(r, max(g, b));
+  int m = min(r, min(g, b));
+  int C = L - m;
+
+  if (L < L_MIN)          return "N";
+  if (C < CHROMA_MIN)     return "O";
+
+  float r2 = float(r - m), g2 = float(g - m), b2 = float(b - m);
+  float sumc = r2 + g2 + b2;
+  float rn = r2 / sumc, gn = g2 / sumc, bn = b2 / sumc;
+
+  if (gn >= DOM_T && (gn - max(rn, bn)) >= MARGIN) return "A";// Verde
+  if (rn >= DOM_T && (rn - max(gn, bn)) >= MARGIN) return "V";// Rojo
+  if (bn >= DOM_T && (bn - max(rn, gn)) >= MARGIN) return "R";// Azul
+
+  if (rn >= 0.35f && bn >= 0.35f && gn <= 0.22f) return "C";// Magenta
+  if (rn >= 0.35f && gn >= 0.35f && bn <= 0.22f) return "I";// Amarillo
+  if (gn >= 0.35f && bn >= 0.35f && rn <= 0.22f) return "M";// Cian 
+
+  if (L == r && r - max(g, b) >= CHROMA_MIN) return "R";
+  if (L == g && g - max(r, b) >= CHROMA_MIN) return "A";
+  if (L == b && b - max(r, g) >= CHROMA_MIN) return "V";
+
+  return "O";
+}
+
+// ------------------ Cámara ------------------
+void setupCamera() {
+  camera_config_t config = {};
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_RGB565;
+  config.frame_size   = FRAMESIZE_QQVGA;
+  config.jpeg_quality = 12;
+  config.fb_count     = psramFound() ? 2 : 1;
+
+  esp_err_t rc = esp_camera_init(&config);
+  if (rc != ESP_OK) {
+    Serial.printf("Fallo init cam: 0x%x\n", rc);
+    while (true) delay(1000);
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  s->set_framesize(s, FRAMESIZE_QQVGA);
+  s->set_brightness(s, 1);
+  s->set_saturation(s, 1);
+  s->set_whitebal(s, 0);
+  s->set_gain_ctrl(s, 0);
+  s->set_exposure_ctrl(s, 0);
+
+  pinMode(LED_FLASH_PIN, OUTPUT);
+  digitalWrite(LED_FLASH_PIN, LOW);
+
+  #if FLASH_MODE == 2
+    ledcSetup(FLASH_PWM_CHANNEL, FLASH_PWM_FREQ, FLASH_PWM_BITS);
+    ledcAttachPin(LED_FLASH_PIN, FLASH_PWM_CHANNEL);
+    ledcWrite(FLASH_PWM_CHANNEL, FLASH_LEVEL);
+  #endif
+}
+
+// ------------------ Detección ------------------
+static void detectAndMeasure(float &avgH, float &avgS, float &avgV,
+                             float &avgR, float &avgG, float &avgB) {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) { avgH=avgS=avgV=avgR=avgG=avgB=0; return; }
+
+  #if FLASH_MODE == 1
+    digitalWrite(LED_FLASH_PIN, HIGH);
+  #endif
+
+  const int w = fb->width, h = fb->height;
+  uint16_t *px = (uint16_t*)fb->buf;
+
+  int rp = constrain(ROI_PERCENT, 10, 100);
+  const int rw = (w * rp) / 100;
+  const int rh = (h * rp) / 100;
+
+  int cx = constrain(ROI_CX_PERCENT, 0, 100) * w / 100;
+  int cy = constrain(ROI_CY_PERCENT, 0, 100) * h / 100;
+  const int rx = constrain(cx - rw/2, 0, w - rw);
+  const int ry = constrain(cy - rh/2, 0, h - rh);
+
+  double sumH=0, sumS=0, sumV=0;
+  double sumr=0, sumg=0, sumb=0;
+  uint32_t N=0;
+
+  for (int y = ry; y < ry + rh; y += SAMPLE_STEP) {
+    const int row = y * w;
+    for (int x = rx; x < rx + rw; x += SAMPLE_STEP) {
+      uint16_t p = px[row + x];
+      uint8_t r = ((p >> 11) & 0x1F) << 3;
+      uint8_t g = ((p >> 5)  & 0x3F) << 2;
+      uint8_t b = (p & 0x1F) << 3;
+
+      float H,S,V; rgb2hsv(r,g,b,H,S,V);
+
+      sumH += H; sumS += S; sumV += V;
+      sumr += r; sumg += g; sumb += b;
+      N++;
+    }
+    yield();
+  }
+
+  esp_camera_fb_return(fb);
+
+  #if FLASH_MODE == 1
+    delay(FLASH_PULSE_MS);
+    digitalWrite(LED_FLASH_PIN, LOW);
+  #endif
+
+  if (N==0) { avgH=avgS=avgV=avgR=avgG=avgB=0; return; }
+
+  avgH = sumH/N; avgS = sumS/N; avgV = sumV/N;
+  avgR = sumr/N; avgG = sumg/N; avgB = sumb/N;
+}
+
+// ------------------ Setup / Loop ------------------
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  WiFi.mode(WIFI_OFF);
+  setupCamera();
+}
+
+// Contadores de colores en el lapso
+static uint16_t countR=0, countV=0, countA=0, countM=0, countO=0;
+static unsigned long lastDecision = 0;
+const unsigned long decisionInterval = 800; // ms entre decisiones
+
+void loop() {
+  float aH,aS,aV,aR,aG,aB;
+  detectAndMeasure(aH,aS,aV,aR,aG,aB);
+
+  // Suavizado EMA
+  if (!ema_init) {
+    h_ema=aH; s_ema=aS; v_ema=aV;
+    r_ema=aR; g_ema=aG; b_ema=aB;
+    ema_init=true;
+  } else {
+    h_ema = EMA_ALPHA*aH + (1.0f-EMA_ALPHA)*h_ema;
+    s_ema = EMA_ALPHA*aS + (1.0f-EMA_ALPHA)*s_ema;
+    v_ema = EMA_ALPHA*aV + (1.0f-EMA_ALPHA)*v_ema;
+    r_ema = EMA_ALPHA*aR + (1.0f-EMA_ALPHA)*r_ema;
+    g_ema = EMA_ALPHA*aG + (1.0f-EMA_ALPHA)*g_ema;
+    b_ema = EMA_ALPHA*aB + (1.0f-EMA_ALPHA)*b_ema;
+  }
+  float pR=r_ema, pG=g_ema, pB=b_ema;
+
+  const char* etiqueta = classifyColorRGB((int)roundf(pR),
+                                          (int)roundf(pG),
+                                          (int)roundf(pB));
+
+  // Contar ocurrencias
+  switch (etiqueta[0]) {
+    case 'R': countR++; break;
+    case 'V': countV++; break;
+    case 'A': countA++; break;
+    case 'M': countM++; break;
+    default:  countO++; break;
+  }
+
+  unsigned long now = millis();
+  if (now - lastDecision >= decisionInterval) {
+    lastDecision = now;
+
+    // Decidir color mayoritario
+    char colorFinal = 'O';
+    uint16_t maxCount = 0;
+    if (countR > maxCount) { maxCount = countR; colorFinal = 'R'; }
+    if (countV > maxCount) { maxCount = countV; colorFinal = 'V'; }
+    if (countA > maxCount) { maxCount = countA; colorFinal = 'A'; }
+    if (countM > maxCount) { maxCount = countM; colorFinal = 'M'; }
+
+    // Enviar solo si no estamos en calibración y SEND_CHAR activo
+    if (!CALIBRATION_MODE && SEND_CHAR) {
+      Serial1.write(colorFinal); // al MEGA
+    }
+
+    // Debug en calibración
+    if (CALIBRATION_MODE) {
+      Serial.printf("Mayoría: %c | R=%u V=%u A=%u M=%u O=%u\n",
+                    colorFinal, countR, countV, countA, countM, countO);
+    }
+
+    // Reset contadores
+    countR = countV = countA = countM = countO = 0;
+  }
+}
